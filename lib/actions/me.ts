@@ -1,0 +1,745 @@
+// This file contains server-side actions related to user profile management, including fetching and updating user data, as well as handling password changes. It uses Prisma for database interactions and NextAuth for session management. The functions are designed to be used in a Next.js application with server-side rendering and caching capabilities.
+
+'use server'
+
+import prisma from '@/lib/prisma'
+import { hash, compare } from 'bcrypt'
+import { cache } from 'react'
+import { cacheLife, cacheTag, revalidateTag } from 'next/cache'
+import { getServerSession, Session } from 'next-auth'
+import { authOptions } from '@/lib/authOptions'
+import { isValidEmail } from '@/lib/helper'
+import { sanitizeUser, requireUser } from '@/lib/actions/guard'
+import { recordAudit } from '@/lib/actions/audit'
+import { nextReferenceId } from '@/lib/referenceId'
+import { normalizeSex, patientInfoFromProfile } from '@/src/data/patientInfo'
+import type { MyProfileView } from '@/src/data/patientInfo'
+
+const MIN_PASSWORD_LENGTH = 8
+
+// Fetches the current user's data from the database based on their session ID. It checks for user authentication and returns the user's sanitized data if found, or an appropriate error message if not authenticated or if an error occurs during the database query.
+//
+// For staff accounts the session id is `staff.staffid`, so we query the Staff
+// table (by `staffid`) instead of the User table (by `id`). The session's
+// `accountType` field tells us which table to use.
+async function getMeData(id: string, accountType?: string) {
+  'use cache'
+  cacheTag('me')
+  cacheLife('max')
+
+  // Check if the user is authenticated by verifying the session ID. If not authenticated, return an error message.
+  try {
+    const isStaff = accountType === 'staff'
+    const me = isStaff
+      ? await prisma.staff.findUnique({ where: { staffid: id } })
+      : await prisma.user.findFirst({ where: { id } })
+
+    console.log(`---DB HIT: GET ME with ID: ${id} from database---`)
+
+    if (!me) {
+      return {
+        success: true,
+        payload: null,
+      }
+    }
+
+    return {
+      success: true,
+      payload: sanitizeUser(me),
+      message: 'My data fetched successfully!',
+    }
+  } catch (error) {
+    console.error('[getMe | Prisma | Error]:', error)
+    return {
+      success: false,
+      payload: null,
+      message: 'Failed to get my data!',
+    }
+  }
+}
+
+// GET LOG IN USER
+export const getMe = cache(async () => {
+  const session = (await getServerSession(authOptions)) as Session | null
+
+  if (!session || !session.user || !session.user.id) {
+    return {
+      success: false,
+      payload: null,
+      message: 'User not authenticated!',
+    }
+  }
+
+  return getMeData(session.user.id, session.user.accountType)
+})
+
+// Converts a user object to a profile view object.
+function toProfileView(user: any): MyProfileView {
+  const p = user?.profile ?? {}
+  const patient = user?.patients?.find((item: any) => !item.familyMemberId)
+  return {
+    referenceId: user?.id ?? '',
+    email: user?.email ?? '',
+    firstName: p.firstName ?? '',
+    middleName: p.middleName ?? '',
+    lastName: p.lastName ?? '',
+    suffix: p.suffix ?? '',
+    birthdate: p.birthdate
+      ? new Date(p.birthdate).toISOString().slice(0, 10)
+      : '',
+    sex: normalizeSex(p.sex || patient?.sex),
+    phoneNumber: p.phoneNumber ?? '',
+    houseNumber: p.houseNumber ?? '',
+    barangay: p.barangay ?? '',
+    city: p.city ?? '',
+    province: p.province ?? '',
+    zipCode: p.zipCode ?? '',
+    purok: p.purok ?? '',
+    philHealthNo: p.philHealthNo ?? '',
+    bloodType: p.bloodType ?? '',
+    religion: p.religion ?? '',
+    fathersName: p.fathersName ?? '',
+    mothersName: p.mothersName ?? '',
+    membershipType: p.membershipType ?? '',
+    philHealthStatus: p.philHealthStatus ?? '',
+    familyMembers: Array.isArray(user?.familyMembers)
+      ? user.familyMembers.map((m: any) => ({
+          id: m.familymemberid ?? '',
+          name: m.name ?? '',
+          relation: m.relation ?? '',
+          phone: m.phone ?? '',
+          birthdate: m.birthdate
+            ? new Date(m.birthdate).toISOString().slice(0, 10)
+            : '',
+          sex: m.sex ?? '',
+          houseNumber: m.houseNumber ?? '',
+          barangay: m.barangay ?? '',
+          city: m.city ?? '',
+          province: m.province ?? '',
+          zipCode: m.zipCode ?? '',
+          purok: m.purok ?? '',
+          philHealthNo: m.philHealthNo ?? '',
+          bloodType: m.bloodType ?? '',
+          religion: m.religion ?? '',
+          fathersName: m.fathersName ?? '',
+          mothersName: m.mothersName ?? '',
+        }))
+      : [],
+  }
+}
+
+// Fetches the current user's profile data from the database, including personal information and family members. It checks for user authentication and returns the profile view object if found, or an appropriate error message if not authenticated or if an error occurs during the database query.
+export async function getMyProfile(): Promise<{
+  success: boolean
+  message: string
+  profile: MyProfileView | null
+}> {
+  const session = await requireUser()
+  if (!session?.user?.id) {
+    return { success: false, message: 'User not authenticated!', profile: null }
+  }
+
+  try {
+    const user = await (prisma as any).user.findFirst({
+      where: { id: session.user.id },
+      include: {
+        profile: true,
+        patients: { select: { familyMemberId: true, sex: true } },
+        familyMembers: { orderBy: { createdAt: 'asc' } },
+      },
+    })
+    if (!user) {
+      return { success: false, message: 'Account not found.', profile: null }
+    }
+
+    return {
+      success: true,
+      message: 'Profile fetched successfully!',
+      profile: toProfileView(user),
+    }
+  } catch (error) {
+    console.error('[getMyProfile | Prisma | Error]:', error)
+    return {
+      success: false,
+      message: 'Failed to fetch profile.',
+      profile: null,
+    }
+  }
+}
+
+// Updates the current user's profile data in the database based on the provided form data. It checks for user authentication, validates the input fields, and updates the user's personal information and family members. The function returns a success status, message, and the updated profile view object if successful, or an appropriate error message if not authenticated or if validation fails.
+export async function updateMyProfile(
+  _prevState: any,
+  formData: FormData,
+): Promise<{
+  success: boolean
+  message: string | null
+  errors?: Record<string, string>
+  payload?: MyProfileView | null
+}> {
+  const session = await requireUser()
+  if (!session?.user?.id) {
+    return { success: false, message: 'User not authenticated!' }
+  }
+
+  const id = session.user.id
+
+  const firstName = formData.get('firstName')?.toString().trim() || ''
+  const middleName = formData.get('middleName')?.toString().trim() || ''
+  const lastName = formData.get('lastName')?.toString().trim() || ''
+  const suffix = formData.get('suffix')?.toString().trim() || ''
+  const birthdate = formData.get('birthdate')?.toString().trim() || ''
+  const sex = formData.get('sex')?.toString().trim() || ''
+  const phoneNumber = formData.get('phoneNumber')?.toString().trim() || ''
+  const email = formData.get('email')?.toString().trim().toLowerCase() || ''
+  const houseNumber = formData.get('houseNumber')?.toString().trim() || ''
+  const barangay = formData.get('barangay')?.toString().trim() || ''
+  const city = formData.get('city')?.toString().trim() || ''
+  const province = formData.get('province')?.toString().trim() || ''
+  const zipCode = formData.get('zipCode')?.toString().trim() || ''
+  const purok = formData.get('purok')?.toString().trim() || ''
+  const philHealthNo = formData.get('philHealthNo')?.toString().trim() || ''
+  const membershipType = formData.get('membershipType')?.toString().trim() || ''
+  const philHealthStatus =
+    formData.get('philHealthStatus')?.toString().trim() || ''
+  const bloodType = formData.get('bloodType')?.toString().trim() || ''
+  const religion = formData.get('religion')?.toString().trim() || ''
+  const fathersName = formData.get('fathersName')?.toString().trim() || ''
+  const mothersName = formData.get('mothersName')?.toString().trim() || ''
+
+  const familyIds = formData
+    .getAll('familyMemberId')
+    .map((v) => v.toString().trim())
+  const familyNames = formData
+    .getAll('familyName')
+    .map((v) => v.toString().trim())
+  const familyRelations = formData
+    .getAll('familyRelation')
+    .map((v) => v.toString().trim())
+  const familyPhones = formData
+    .getAll('familyPhone')
+    .map((v) => v.toString().trim())
+  const familyBirthdates = formData
+    .getAll('familyBirthdate')
+    .map((v) => v.toString().trim())
+  const familySexes = formData
+    .getAll('familySex')
+    .map((v) => v.toString().trim())
+  const familyHouseNumbers = formData
+    .getAll('familyHouseNumber')
+    .map((v) => v.toString().trim())
+  const familyBarangays = formData
+    .getAll('familyBarangay')
+    .map((v) => v.toString().trim())
+  const familyCities = formData
+    .getAll('familyCity')
+    .map((v) => v.toString().trim())
+  const familyProvinces = formData
+    .getAll('familyProvince')
+    .map((v) => v.toString().trim())
+  const familyZipCodes = formData
+    .getAll('familyZipCode')
+    .map((v) => v.toString().trim())
+  const familyPuroks = formData
+    .getAll('familyPurok')
+    .map((v) => v.toString().trim())
+  const familyPhilHealthNos = formData
+    .getAll('familyPhilHealthNo')
+    .map((v) => v.toString().trim())
+  const familyBloodTypes = formData
+    .getAll('familyBloodType')
+    .map((v) => v.toString().trim())
+  const familyReligions = formData
+    .getAll('familyReligion')
+    .map((v) => v.toString().trim())
+  const familyFathersNames = formData
+    .getAll('familyFathersName')
+    .map((v) => v.toString().trim())
+  const familyMothersNames = formData
+    .getAll('familyMothersName')
+    .map((v) => v.toString().trim())
+  const familyRowCount = Math.max(
+    familyNames.length,
+    familyRelations.length,
+    familyPhones.length,
+    familyBirthdates.length,
+    familySexes.length,
+    familyHouseNumbers.length,
+    familyBarangays.length,
+    familyCities.length,
+    familyProvinces.length,
+    familyZipCodes.length,
+    familyPuroks.length,
+    familyPhilHealthNos.length,
+    familyBloodTypes.length,
+    familyReligions.length,
+    familyFathersNames.length,
+    familyMothersNames.length,
+  )
+  const familyRows: {
+    id: string | null
+    name: string
+    relation: string
+    phone: string | null
+    birthdate: Date | null
+    sex: string | null
+    houseNumber: string | null
+    barangay: string | null
+    city: string | null
+    province: string | null
+    zipCode: string | null
+    purok: string | null
+    philHealthNo: string | null
+    bloodType: string | null
+    religion: string | null
+    fathersName: string | null
+    mothersName: string | null
+  }[] = []
+  let familyError: string | null = null
+  for (let i = 0; i < familyRowCount; i++) {
+    const name = familyNames[i] ?? ''
+    const relation = familyRelations[i] ?? ''
+    const phone = familyPhones[i] ?? ''
+    const birthdate = familyBirthdates[i] ?? ''
+    const sex = familySexes[i] ?? ''
+    const houseNumber = familyHouseNumbers[i] ?? ''
+    const barangay = familyBarangays[i] ?? ''
+    const city = familyCities[i] ?? ''
+    const province = familyProvinces[i] ?? ''
+    const zipCode = familyZipCodes[i] ?? ''
+    const familyPurok = familyPuroks[i] ?? ''
+    const philHealthNo = familyPhilHealthNos[i] ?? ''
+    const familyBloodType = familyBloodTypes[i] ?? ''
+    const familyReligion = familyReligions[i] ?? ''
+    const familyFathersName = familyFathersNames[i] ?? ''
+    const familyMothersName = familyMothersNames[i] ?? ''
+    if (
+      !name &&
+      !relation &&
+      !phone &&
+      !birthdate &&
+      !sex &&
+      !houseNumber &&
+      !barangay &&
+      !city &&
+      !province &&
+      !zipCode &&
+      !familyPurok &&
+      !philHealthNo &&
+      !familyBloodType &&
+      !familyReligion &&
+      !familyFathersName &&
+      !familyMothersName
+    ) {
+      continue
+    }
+    if (!name || !relation) {
+      familyError = 'Each family member needs at least a name and a relation.'
+      break
+    }
+    let parsedBirthdate: Date | null = null
+    if (birthdate) {
+      parsedBirthdate = new Date(`${birthdate}T00:00:00.000Z`)
+      if (Number.isNaN(parsedBirthdate.getTime())) {
+        familyError = `Please provide a valid date of birth for ${name}.`
+        break
+      }
+    }
+    familyRows.push({
+      id: familyIds[i] || null,
+      name,
+      relation,
+      phone: phone || null,
+      birthdate: parsedBirthdate,
+      sex: sex || null,
+      houseNumber: houseNumber || null,
+      barangay: barangay || null,
+      city: city || null,
+      province: province || null,
+      zipCode: zipCode || null,
+      purok: familyPurok || null,
+      philHealthNo: philHealthNo || null,
+      bloodType: familyBloodType || null,
+      religion: familyReligion || null,
+      fathersName: familyFathersName || null,
+      mothersName: familyMothersName || null,
+    })
+  }
+
+  let errors: Record<string, string> = {}
+
+  const requiredFields: Array<[string, string, string]> = [
+    ['firstName', 'First name', firstName],
+    ['lastName', 'Last name', lastName],
+    ['birthdate', 'Date of birth', birthdate],
+    ['phoneNumber', 'Mobile number', phoneNumber],
+    ['email', 'Email address', email],
+    ['houseNumber', 'House no./street', houseNumber],
+    ['barangay', 'Barangay', barangay],
+    ['city', 'Municipality/city', city],
+    ['province', 'Province', province],
+    ['zipCode', 'ZIP code', zipCode],
+  ]
+
+  requiredFields.forEach(([key, label, value]) => {
+    if (!value) {
+      errors[key] = `${label} is required.`
+    }
+  })
+
+  if (email && !isValidEmail(email)) {
+    errors['email'] = 'Please enter a valid email address.'
+  }
+
+  let parsedBirthdate: Date | null = null
+  if (birthdate) {
+    parsedBirthdate = new Date(`${birthdate}T00:00:00.000Z`)
+    if (Number.isNaN(parsedBirthdate.getTime())) {
+      errors['birthdate'] = 'Please provide a valid date of birth.'
+    }
+  }
+
+  if (familyError) {
+    errors['familyMembers'] = familyError
+  }
+
+  if (Object.keys(errors).length > 0) {
+    return { success: false, message: null, errors }
+  }
+
+  // Check if the email is already taken by another user (excluding the current user). If the email is taken, return an error message indicating that the email is already registered to another account.
+  try {
+    const emailTaken = await (prisma as any).user.findFirst({
+      where: { email, NOT: { id } },
+      select: { id: true },
+    })
+    if (emailTaken) {
+      return {
+        success: false,
+        message: `Email ${email} is already registered to another account.`,
+        errors: { email: 'This email is already registered.' },
+      }
+    }
+
+    const profileData = {
+      firstName,
+      middleName: middleName || null,
+      lastName,
+      suffix: suffix || null,
+      birthdate: parsedBirthdate,
+      sex: sex || null,
+      phoneNumber,
+      houseNumber,
+      barangay,
+      city,
+      province,
+      zipCode,
+      purok: purok || null,
+      philHealthNo: philHealthNo || null,
+      membershipType: membershipType || null,
+      philHealthStatus: philHealthStatus || null,
+      bloodType: bloodType || null,
+      religion: religion || null,
+      fathersName: fathersName || null,
+      mothersName: mothersName || null,
+      updatedAt: new Date(),
+    }
+
+    const existingFamilyMembers = await (prisma as any).familyMember.findMany({
+      where: { userId: id },
+      select: { familymemberid: true },
+    })
+    const existingFamilyMemberIds = new Set(
+      existingFamilyMembers.map((member: any) => member.familymemberid),
+    )
+    const retainedFamilyMemberIds = familyRows
+      .map((member) => member.id)
+      .filter((memberId): memberId is string =>
+        Boolean(memberId && existingFamilyMemberIds.has(memberId)),
+      )
+    const familyUpdates = await Promise.all(
+      familyRows.map(async (member) => {
+        const familymemberid =
+          member.id && existingFamilyMemberIds.has(member.id)
+            ? member.id
+            : await nextReferenceId('FAM')
+        const { id: _id, ...data } = member
+        return { familymemberid, data }
+      }),
+    )
+
+    await (prisma as any).$transaction([
+      (prisma as any).userProfile.upsert({
+        where: { userId: id },
+        update: profileData,
+        create: {
+          userprofileid: await nextReferenceId('PRF'),
+          userId: id,
+          ...profileData,
+        },
+      }),
+      (prisma as any).user.update({
+        where: { id },
+        data: { email, updatedAt: new Date() },
+      }),
+      (prisma as any).familyMember.deleteMany({
+        where: {
+          userId: id,
+          ...(retainedFamilyMemberIds.length
+            ? { familymemberid: { notIn: retainedFamilyMemberIds } }
+            : {}),
+          appointments: { none: {} },
+          patients: { none: {} },
+        },
+      }),
+      ...familyUpdates.map(({ familymemberid, data }) =>
+        (prisma as any).familyMember.upsert({
+          where: { familymemberid },
+          update: data,
+          create: { familymemberid, userId: id, ...data },
+        }),
+      ),
+    ])
+
+    const fresh = await (prisma as any).user.findFirst({
+      where: { id },
+      include: {
+        profile: true,
+        familyMembers: { orderBy: { createdAt: 'asc' } },
+      },
+    })
+
+    return {
+      success: true,
+      message: 'Profile updated successfully!',
+      payload: fresh ? toProfileView(fresh) : null,
+    }
+  } catch (error) {
+    console.error('[updateMyProfile | Prisma | Error]:', error)
+    return {
+      success: false,
+      message: 'Failed to update profile. Please try again.',
+    }
+  }
+}
+
+// Updates the current user's profile data in the database based on the provided form data. It checks for user authentication, validates the input fields, and updates the user's personal information and family members. The function returns a success status, message, and the updated profile view object if successful, or an appropriate error message if not authenticated or if validation fails.
+export async function updateMe(_prevState: any, formData: FormData) {
+  const session = await getServerSession(authOptions)
+  const id = session?.user?.id as string
+  const accountType = session?.user?.accountType as string
+  const isStaff = accountType === 'staff'
+
+  const name = formData.get('name')?.toString().trim() || null
+  const email = formData.get('email')?.toString().trim() || null
+  const image = formData.get('image')?.toString().trim() || null
+  const updatedAt = new Date()
+
+  const removeImage = formData.get('removeProfile') === 'true'
+
+  try {
+    let updateData: Record<string, any> = {
+      updatedAt: updatedAt,
+    }
+    if (name) updateData.name = name
+    if (email) updateData.email = email
+    if (image) updateData.image = image
+
+    if (removeImage) {
+      updateData.image = null
+    }
+
+    const requiredFields = [
+      { key: 'name', label: 'Name', value: name },
+      { key: 'email', label: 'Email', value: email },
+    ]
+
+    let errors: Record<string, string> = {}
+    requiredFields.forEach(({ key, label, value }) => {
+      if (!value) {
+        errors[key] = `${label} is required.`
+      }
+    })
+
+    if (email && !isValidEmail(email)) {
+      errors['email'] = 'Please enter a valid email address.'
+    }
+
+    if (Object.keys(errors).length > 0) {
+      return {
+        success: false,
+        errors,
+        input: {
+          name,
+          email,
+          id,
+        },
+        message: null,
+      }
+    }
+
+    if (email) {
+      let emailConflict: any = null
+      if (isStaff) {
+        emailConflict = await prisma.staff.findFirst({
+          where: { email, NOT: { staffid: id } },
+        })
+      } else {
+        emailConflict = await prisma.user.findFirst({
+          where: { email, NOT: { id } },
+        })
+      }
+      if (emailConflict) {
+        return {
+          success: false,
+          payload: null,
+          message: `Email ${email} already exists. Please use a different email.`,
+        }
+      }
+    }
+
+    const updatedUser = isStaff
+      ? await prisma.staff.update({
+          where: { staffid: id },
+          data: updateData,
+        })
+      : await prisma.user.update({
+          where: { id },
+          data: updateData,
+        })
+
+    revalidateTag('me', 'max')
+
+    return {
+      success: true,
+      payload: sanitizeUser(updatedUser),
+      message: 'Profile updated successfully!',
+    }
+  } catch (error) {
+    console.error('lib/actions/me.ts: ', error)
+    return {
+      success: false,
+      payload: null,
+      message: 'Failed to update profile. Please call admin.',
+    }
+  }
+}
+
+// Updates the current user's password in the database based on the provided form data. It checks for user authentication, validates the input fields, and updates the user's password if the current password is correct and the new password meets the required criteria. The function returns a success status, message, and the updated user data if successful, or an appropriate error message if not authenticated or if validation fails.
+
+export async function updateMePassword(_prevState: any, formData: FormData) {
+  const session = (await getServerSession(authOptions)) as Session | null
+  if (!session || !session.user || !session.user.id) {
+    return {
+      success: false,
+      payload: null,
+      message: 'User not authenticated!',
+    }
+  }
+
+  const id = session.user.id
+  const accountType = session.user.accountType
+  const isStaff = accountType === 'staff'
+
+  const current_password = formData.get('current_password')?.toString().trim()
+  const new_password = formData.get('new_password')?.toString().trim()
+  const confirm_password = formData.get('confirm_password')?.toString().trim()
+
+  let errors: Record<string, string> = {}
+
+  const requiredFields = [
+    {
+      key: 'current_password',
+      label: 'Current Password',
+      value: current_password,
+    },
+    { key: 'new_password', label: 'New Password', value: new_password },
+    {
+      key: 'confirm_password',
+      label: 'Confirm Password',
+      value: confirm_password,
+    },
+  ]
+
+  requiredFields.forEach(({ key, label, value }) => {
+    if (!value) {
+      errors[key] = `${label} is required.`
+    }
+  })
+
+  if (new_password !== confirm_password) {
+    errors['confirm_password'] =
+      'New password and confirm password do not match.'
+  }
+
+  if (new_password && new_password.length < MIN_PASSWORD_LENGTH) {
+    errors['new_password'] =
+      `New password must be at least ${MIN_PASSWORD_LENGTH} characters long.`
+  }
+
+  if (Object.keys(errors).length > 0) {
+    return {
+      success: false,
+      errors,
+      input: { id },
+      message: null,
+    }
+  }
+
+  try {
+    // Staff records live in the Staff table (keyed by staffid); user records
+    // live in the User table (keyed by id). The session's accountType tells us
+    // which table to query.
+    const me = isStaff
+      ? await prisma.staff.findUnique({ where: { staffid: id } })
+      : await prisma.user.findFirst({ where: { id } })
+
+    if (
+      !me ||
+      !me.password ||
+      !(await compare(current_password!, me.password))
+    ) {
+      return {
+        success: false,
+        errors: { current_password: 'Current password is incorrect.' },
+        input: { id },
+        message: null,
+      }
+    }
+
+    const hashedPassword = await hash(new_password, 12)
+
+    const updatedUser = isStaff
+      ? await prisma.staff.update({
+          where: { staffid: id },
+          data: { password: hashedPassword, updatedAt: new Date() },
+        })
+      : await prisma.user.update({
+          where: { id },
+          data: { password: hashedPassword, updatedAt: new Date() },
+        })
+
+    revalidateTag('me', 'max')
+
+    await recordAudit({
+      action: 'PASSWORD_CHANGE',
+      entity: 'PROFILE',
+      entityId: id,
+      description: 'Changed own account password.',
+      metadata: { self: true },
+    })
+
+    return {
+      success: true,
+      payload: sanitizeUser(updatedUser),
+      message: 'Password updated successfully.',
+    }
+  } catch (error) {
+    console.error('[updateMePassword | Prisma | Error]:', error)
+    return {
+      success: false,
+      payload: null,
+      message: 'Failed to update password.',
+    }
+  }
+}
