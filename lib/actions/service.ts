@@ -4,6 +4,7 @@
 import prisma from '@/lib/prisma'
 import { revalidateTag } from 'next/cache'
 import { requireUser, requireAdmin } from '@/lib/actions/guard'
+import { SERVICE_TIME_RANGE, normalizeServiceTime } from '@/config/appointment'
 import { recordAudit } from '@/lib/actions/audit'
 import { nextReferenceId } from '@/lib/referenceId'
 
@@ -15,8 +16,15 @@ export type ServiceItem = {
   icon: string
   desc: string
   availability?: boolean
+  archivedAt?: string | null
   createdAt?: Date
   updatedAt?: Date
+}
+
+function toIsoOrNull(value: unknown): string | null {
+  if (!value) return null
+  if (value instanceof Date) return value.toISOString()
+  return String(value)
 }
 
 // Parses a raw service object from the database and converts it into a structured ServiceItem. It extracts metadata from the service description, such as subtitle, time, and icon, and returns a ServiceItem with the relevant properties. If the description is not in JSON format, it defaults to using the raw description as the service description.
@@ -38,9 +46,10 @@ function parseService(s: any): ServiceItem {
     title: s.name,
     desc: meta.desc || s.description || '',
     subtitle: meta.subtitle || 'Monday to Friday',
-    time: meta.time || '8:00am - 5:00pm',
+    time: normalizeServiceTime(meta.time || SERVICE_TIME_RANGE),
     icon: meta.icon || '🩺',
     availability: s.availability ?? true,
+    archivedAt: toIsoOrNull(s.archivedAt),
     createdAt: s.createdAt,
     updatedAt: s.updatedAt,
   }
@@ -55,7 +64,7 @@ function formatServiceDescription(meta: {
   return JSON.stringify({
     desc: meta.desc || '',
     subtitle: meta.subtitle || 'Monday to Friday',
-    time: meta.time || '8:00am - 5:00pm',
+    time: normalizeServiceTime(meta.time || SERVICE_TIME_RANGE),
     icon: meta.icon || '🩺',
   })
 }
@@ -64,49 +73,49 @@ const defaultSeedServices = [
   {
     title: 'Basic Consultation',
     subtitle: 'Monday to Friday',
-    time: '8:00am - 5:00pm',
+    time: SERVICE_TIME_RANGE,
     icon: '👩‍⚕️',
     desc: 'General medical consultation for patients of all ages. Includes check-ups, diagnosis, and treatment recommendations.',
   },
   {
     title: 'Pre-natal Care',
     subtitle: 'Tuesday',
-    time: '8:00am - 5:00pm',
+    time: SERVICE_TIME_RANGE,
     icon: '🤰',
     desc: 'Comprehensive care for pregnant women including check-ups, nutritional counseling, and monitoring of fetal development.',
   },
   {
     title: 'National Immunization Program (NIP)',
     subtitle: 'Wednesday to Friday',
-    time: '8:00am - 5:00pm',
+    time: SERVICE_TIME_RANGE,
     icon: '💉',
     desc: 'Routine immunization for infants, children, and adults following the national vaccination schedule.',
   },
   {
     title: 'Hypertension Detection and Management (HDM)',
     subtitle: 'Monday to Friday',
-    time: '8:00am - 5:00pm',
+    time: SERVICE_TIME_RANGE,
     icon: '🩸',
     desc: 'Blood pressure screening, monitoring, and treatment for hypertensive patients.',
   },
   {
     title: 'Visual Inspection with Acetic Acid (VIA)',
     subtitle: 'Thursday',
-    time: '8:00am - 5:00pm',
+    time: SERVICE_TIME_RANGE,
     icon: '🔬',
     desc: 'Cervical cancer screening procedure for early detection of abnormalities.',
   },
   {
     title: 'Family Planning',
     subtitle: 'Thursday',
-    time: '8:00am - 5:00pm',
+    time: SERVICE_TIME_RANGE,
     icon: '🧬',
     desc: 'Counseling and services for various family planning methods, reproductive health education, and informed choice.',
   },
   {
     title: 'Pills and Condoms',
     subtitle: 'Monday to Friday',
-    time: '8:00am - 5:00pm',
+    time: SERVICE_TIME_RANGE,
     icon: '💊',
     desc: 'Distribution and counseling on oral contraceptive pills and condoms for safe and responsible family planning.',
   },
@@ -150,7 +159,12 @@ export async function getServices() {
     return {
       success: true,
       message: 'Services fetched successfully',
-      services: rawServices.map(parseService),
+      services: rawServices
+        .map(parseService)
+        .filter((s: any) => !s.archivedAt),
+      archive: rawServices
+        .map(parseService)
+        .filter((s: any) => Boolean(s.archivedAt)),
     }
   } catch (error) {
     console.error('[getServices | Prisma | Error]:', error)
@@ -158,6 +172,7 @@ export async function getServices() {
       success: false,
       message: 'Failed to fetch services from database.',
       services: [],
+      archive: [],
     }
   }
 }
@@ -187,7 +202,7 @@ export async function createService(data: {
         description: formatServiceDescription({
           desc: data.desc || '',
           subtitle: data.subtitle || 'Monday to Friday',
-          time: data.time || '8:00am - 5:00pm',
+          time: data.time || SERVICE_TIME_RANGE,
           icon: data.icon || '🩺',
         }),
         availability: data.availability !== undefined ? data.availability : true,
@@ -244,7 +259,7 @@ export async function updateService(data: {
     updateData.description = formatServiceDescription({
       desc: data.desc || '',
       subtitle: data.subtitle || 'Monday to Friday',
-      time: data.time || '8:00am - 5:00pm',
+      time: data.time || SERVICE_TIME_RANGE,
       icon: data.icon || '🩺',
     })
 
@@ -277,7 +292,7 @@ export async function updateService(data: {
   }
 }
 
-export async function deleteService(id: string) {
+export async function archiveService(id: string) {
   const session = await requireUser()
   if (!session) {
     return { success: false, message: 'Unauthorized' }
@@ -290,25 +305,95 @@ export async function deleteService(id: string) {
   try {
     const existing = await (prisma as any).service.findUnique({
       where: { serviceid: id },
-      select: { name: true },
     })
-    await (prisma as any).service.delete({
+
+    if (!existing) {
+      return { success: false, message: 'Service not found.' }
+    }
+
+    if (existing.archivedAt) {
+      return {
+        success: true,
+        message: 'Service is already archived.',
+        service: parseService(existing),
+      }
+    }
+
+    const archived = await (prisma as any).service.update({
       where: { serviceid: id },
+      data: { archivedAt: new Date() },
     })
 
     revalidateTag('services', 'max')
 
     await recordAudit({
-      action: 'DELETE',
+      action: 'ARCHIVE',
       entity: 'SERVICE',
       entityId: id,
-      description: `Deleted service "${existing?.name ?? id}".`,
-      metadata: { name: existing?.name ?? null },
+      description: `Archived service "${archived.name}".`,
+      metadata: { name: archived.name },
     })
 
-    return { success: true, message: 'Service deleted successfully from database.' }
+    return {
+      success: true,
+      message: 'Service archived successfully.',
+      service: parseService(archived),
+    }
   } catch (error) {
-    console.error('[deleteService | Prisma | Error]:', error)
-    return { success: false, message: 'Failed to delete service from database.' }
+    console.error('[archiveService | Prisma | Error]:', error)
+    return { success: false, message: 'Failed to archive service.' }
+  }
+}
+
+export async function restoreService(id: string) {
+  const session = await requireUser()
+  if (!session) {
+    return { success: false, message: 'Unauthorized' }
+  }
+
+  if (!id) {
+    return { success: false, message: 'Service ID is required.' }
+  }
+
+  try {
+    const existing = await (prisma as any).service.findUnique({
+      where: { serviceid: id },
+    })
+
+    if (!existing) {
+      return { success: false, message: 'Service not found.' }
+    }
+
+    if (!existing.archivedAt) {
+      return {
+        success: true,
+        message: 'Service is already active.',
+        service: parseService(existing),
+      }
+    }
+
+    const restored = await (prisma as any).service.update({
+      where: { serviceid: id },
+      data: { archivedAt: null },
+    })
+
+    revalidateTag('services', 'max')
+
+    await recordAudit({
+      action: 'RESTORE',
+      entity: 'SERVICE',
+      entityId: id,
+      description: `Restored service "${restored.name}" from the archive.`,
+      metadata: { name: restored.name },
+    })
+
+    return {
+      success: true,
+      message: 'Service restored successfully.',
+      service: parseService(restored),
+    }
+  } catch (error) {
+    console.error('[restoreService | Prisma | Error]:', error)
+    return { success: false, message: 'Failed to restore service.' }
   }
 }

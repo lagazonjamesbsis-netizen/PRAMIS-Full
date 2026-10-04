@@ -8,6 +8,7 @@ export type MedicalRecord = {
   type: string
   staffName: string
   role: string
+  position?: string
   condition?: string
   // Vital signs
   bloodPressure?: string
@@ -60,6 +61,7 @@ export type MedicalRecord = {
   consentPatientName?: string
   consentDate?: string
   consentRepresentative?: string
+  itr?: Record<string, string>
   // Child-specific fields
   birthLength?: string
   birthWeight?: string
@@ -101,4 +103,10 @@ export type PatientMember = {
   initials: string
   birthdate?: string
   records: MedicalRecord[]
+}
+
+export function providerDesignation(
+  record: Pick<MedicalRecord, 'position' | 'role'>,
+): string {
+  return record.position?.trim() || record.role?.trim() || ''
 }

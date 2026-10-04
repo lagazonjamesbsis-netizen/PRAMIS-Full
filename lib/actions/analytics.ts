@@ -6,10 +6,54 @@ import { getSlotLabel } from '@/config/appointment'
 import { classifyMedicalCase } from '@/lib/analytics/disease'
 import {
   ANALYTICS_RANGES,
+  isYearRangeKey,
   type AnalyticsRangeKey,
 } from '@/lib/constants/analytics'
 
 export type AnalyticsBreakdown = { label: string; count: number }
+
+export type AnalyticsDateWindow = {
+  start: Date | null
+  end: Date | null
+  label: string
+}
+
+function resolveAnalyticsDateWindow(
+  rangeKey: AnalyticsRangeKey,
+  year?: number | null,
+): AnalyticsDateWindow {
+  const range =
+    ANALYTICS_RANGES.find((r) => r.key === rangeKey) || ANALYTICS_RANGES[1]
+
+  if (isYearRangeKey(range.key)) {
+    const y = year ?? new Date().getFullYear()
+    const safeYear = Number.isFinite(y) ? y : new Date().getFullYear()
+    return {
+      start: new Date(safeYear, 0, 1, 0, 0, 0, 0),
+      end: new Date(safeYear, 11, 31, 23, 59, 59, 999),
+      label: `Year ${safeYear}`,
+    }
+  }
+
+  if (range.days > 0) {
+    const start = new Date()
+    start.setHours(0, 0, 0, 0)
+    start.setDate(start.getDate() - (range.days - 1))
+    const end = new Date()
+    end.setHours(23, 59, 59, 999)
+    return { start, end, label: range.label }
+  }
+
+  return { start: null, end: null, label: range.label }
+}
+
+// Applies a date window to a Prisma `where` clause on the given field.
+function withDateWindow(where: any, field: string, win: AnalyticsDateWindow) {
+  if (win.start && win.end) {
+    where[field] = { gte: win.start, lte: win.end }
+  }
+  return where
+}
 
 // This file contains logic for fetching and computing analytics statistics for the Meditrack application. It includes functions to retrieve appointment data, classify medical cases, and compute various breakdowns such as service share, reasons for visits, outcomes, peak hours, and disease cases within a specified date range. The main function `getAnalyticsStats` returns an object containing the computed statistics along with success status and messages.
 
@@ -51,6 +95,24 @@ export type AnalyticsStats = {
     seniorCitizens: number
     seniorPct: number
   } | null
+  // Trend and drill-down data used by the printable report.
+  dailyTrend: AnalyticsBreakdown[]
+  weeklyTrend: AnalyticsBreakdown[]
+  /** Day-of-week distribution, e.g. "Monday" → count. */
+  weekdayTrend: AnalyticsBreakdown[]
+  /** Most frequent patients in the window. */
+  topPatients: { name: string; visits: number; lastVisit: string }[]
+  /** Per-service completion summary. */
+  serviceMatrix: {
+    service: string
+    total: number
+    completed: number
+    noShow: number
+    cancelled: number
+    completionRate: number
+  }[]
+  /** New vs returning patients in the window. */
+  patientMix: { newPatients: number; returningPatients: number }
 }
 
 // Maps a service name to a reason for the visit based on predefined keywords.
@@ -123,6 +185,7 @@ const AGE_GROUP_ORDER = [
 // Fetches analytics statistics for appointments and medical cases within a specified date range. It computes various breakdowns such as service share, reasons for visits, outcomes, peak hours, and disease cases. The function checks user authorization and returns the computed statistics along with success status and messages.
 export async function getAnalyticsStats(
   rangeKey: AnalyticsRangeKey = '1M',
+  year?: number | null,
 ): Promise<{ success: boolean; message: string; stats?: AnalyticsStats }> {
   const session = await requireUser()
   if (!session) {
@@ -134,18 +197,10 @@ export async function getAnalyticsStats(
     return { success: false, message: 'Unauthorized' }
   }
 
-  const range =
-    ANALYTICS_RANGES.find((r) => r.key === rangeKey) || ANALYTICS_RANGES[1]
+  const window = resolveAnalyticsDateWindow(rangeKey, year)
+  const rangeLabel = window.label
 
-  const where: any = {}
-  if (range.days > 0) {
-    const start = new Date()
-    start.setHours(0, 0, 0, 0)
-    start.setDate(start.getDate() - (range.days - 1))
-    const end = new Date()
-    end.setHours(23, 59, 59, 999)
-    where.appointmentAt = { gte: start, lte: end }
-  }
+  const where: any = withDateWindow({}, 'appointmentAt', window)
 
   // Fetch appointment records from the database based on the specified date range and compute various statistics.
 
@@ -158,7 +213,8 @@ export async function getAnalyticsStats(
         source: true,
         userId: true,
         service: { select: { name: true } },
-        patient: { select: { sex: true } },
+        patient: { select: { sex: true, name: true } },
+        user: { select: { profile: { select: { firstName: true, lastName: true } } } },
       },
     })
 
@@ -262,6 +318,117 @@ export async function getAnalyticsStats(
       .map(([label, count]) => ({ label, count }))
       .sort((a, b) => a.label.localeCompare(b.label))
 
+    // Daily trend (newest last) for the printable report.
+    const dayMap = new Map<string, number>()
+    for (const r of rows) {
+      if (!r.appointmentAt) continue
+      const d = new Date(r.appointmentAt)
+      const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`
+      dayMap.set(key, (dayMap.get(key) ?? 0) + 1)
+    }
+    const dailyTrend = [...dayMap.entries()]
+      .map(([label, count]) => ({ label, count }))
+      .sort((a, b) => a.label.localeCompare(b.label))
+
+    // Day-of-week distribution to reveal busiest weekdays.
+    const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+    const weekdayMap = new Map<string, number>()
+    for (const r of rows) {
+      if (!r.appointmentAt) continue
+      const label = WEEKDAYS[new Date(r.appointmentAt).getUTCDay()]
+      weekdayMap.set(label, (weekdayMap.get(label) ?? 0) + 1)
+    }
+    const weekdayTrend = WEEKDAYS.filter((d) => (weekdayMap.get(d) ?? 0) > 0).map((d) => ({
+      label: d,
+      count: weekdayMap.get(d) ?? 0,
+    }))
+
+    // Most frequent patients, resolved from the patient record or the owner's profile.
+    const visitMap = new Map<string, { name: string; visits: number; last: number }>()
+    for (const r of rows) {
+      if (!r.userId) continue
+      const profile = (r as any).user?.profile
+      const name =
+        (r as any).patient?.name ||
+        [profile?.firstName, profile?.lastName].filter(Boolean).join(' ').trim() ||
+        'Unnamed patient'
+      const at = r.appointmentAt ? new Date(r.appointmentAt).getTime() : 0
+      const entry = visitMap.get(r.userId)
+      if (entry) {
+        entry.visits += 1
+        entry.last = Math.max(entry.last, at)
+      } else {
+        visitMap.set(r.userId, { name, visits: 1, last: at })
+      }
+    }
+    const topPatients = [...visitMap.values()]
+      .sort((a, b) => b.visits - a.visits || b.last - a.last)
+      .slice(0, 15)
+      .map((p) => ({
+        name: p.name,
+        visits: p.visits,
+        lastVisit: p.last ? new Date(p.last).toISOString().slice(0, 10) : '—',
+      }))
+
+    // Per-service completion summary, so the report shows reliability per service.
+    const matrixMap = new Map<
+      string,
+      { total: number; completed: number; noShow: number; cancelled: number }
+    >()
+    for (const r of rows) {
+      const service = r.service?.name ?? 'Others'
+      const statusKey = String(r.status ?? '').toUpperCase()
+      const entry = matrixMap.get(service) ?? { total: 0, completed: 0, noShow: 0, cancelled: 0 }
+      entry.total += 1
+      if (statusKey === 'COMPLETED') entry.completed += 1
+      else if (statusKey === 'NO_SHOW') entry.noShow += 1
+      else if (statusKey === 'CANCELLED') entry.cancelled += 1
+      matrixMap.set(service, entry)
+    }
+    const serviceMatrix = [...matrixMap.entries()]
+      .map(([service, v]) => ({
+        service,
+        total: v.total,
+        completed: v.completed,
+        noShow: v.noShow,
+        cancelled: v.cancelled,
+        completionRate: v.total
+          ? parseFloat(((v.completed / v.total) * 100).toFixed(1))
+          : 0,
+      }))
+      .sort((a, b) => b.total - a.total)
+
+    const patientMix = { newPatients: 0, returningPatients: 0 }
+    if (total > 0) {
+      try {
+        const earliest = new Map<string, Date>()
+        for (const r of rows) {
+          if (!r.userId || !r.appointmentAt) continue
+          const at = new Date(r.appointmentAt)
+          const cur = earliest.get(r.userId)
+          if (!cur || at < cur) earliest.set(r.userId, at)
+        }
+        const ids = [...earliest.keys()]
+        if (ids.length > 0) {
+          const before = await (prisma as any).appointment.groupBy({
+            by: ['userId'],
+            where: {
+              userId: { in: ids },
+              appointmentAt: { lt: where.appointmentAt?.gte ?? new Date() },
+            },
+            _count: { _all: true },
+          })
+          const seenBefore = new Set(before.map((b: any) => b.userId))
+          for (const id of ids) {
+            if (seenBefore.has(id)) patientMix.returningPatients += 1
+            else patientMix.newPatients += 1
+          }
+        }
+      } catch (mixErr) {
+        console.error('[getAnalyticsStats | patientMix | Error]:', mixErr)
+      }
+    }
+
     // Sex breakdown per top-5 services
     const sexServiceMap = new Map<string, { male: number; female: number }>()
     for (const r of rows) {
@@ -284,15 +451,7 @@ export async function getAnalyticsStats(
     let immunization: AnalyticsBreakdown[] = []
 
     try {
-      const mhWhere: any = {}
-      if (range.days > 0) {
-        const mhStart = new Date()
-        mhStart.setHours(0, 0, 0, 0)
-        mhStart.setDate(mhStart.getDate() - (range.days - 1))
-        const mhEnd = new Date()
-        mhEnd.setHours(23, 59, 59, 999)
-        mhWhere.checkedDate = { gte: mhStart, lte: mhEnd }
-      }
+      const mhWhere: any = withDateWindow({}, 'checkedDate', window)
 
       const cases = await (prisma as any).medicalHistory.findMany({
         where: mhWhere,
@@ -541,7 +700,7 @@ export async function getAnalyticsStats(
       success: true,
       message: 'Analytics fetched successfully.',
       stats: {
-        rangeLabel: range.label,
+        rangeLabel,
         total,
         walkIns,
         resident,
@@ -561,10 +720,246 @@ export async function getAnalyticsStats(
         bloodTypes,
         ageGroups,
         pwdStats,
+        dailyTrend,
+        weeklyTrend,
+        weekdayTrend,
+        topPatients,
+        serviceMatrix,
+        patientMix,
       } satisfies AnalyticsStats,
     }
   } catch (error) {
     console.error('[getAnalyticsStats | Prisma | Error]:', error)
     return { success: false, message: 'Failed to fetch analytics.' }
+  }
+}
+
+export type AnalyticsDetailRow = {
+  key: string
+  patientName: string
+  age: number | null
+  sex: string
+  service: string
+  reason: string
+  outcome: string
+  category: string
+  date: string
+  diagnosis: string
+  /** Blood type, shown for the blood-type report. */
+  bloodType: string
+  /** Human-readable appointment time slot, shown for the peak-hours report. */
+  slot: string
+  /** Classified medical condition, shown for the disease report. */
+  disease: string
+  /** Clinician who recorded the visit, shown for the disease report. */
+  checkedBy: string
+}
+
+export type AnalyticsDetailSection = 'serviceShare' | 'reasons' | 'outcomes' | 'peakHours' | 'ageGroups' | 'diseases' | 'sexByService' | 'immunization' | 'bloodTypes'
+
+/**
+ * Returns the individual records behind a chart so the admin can drill into the
+ * patients behind an aggregate. `label` narrows the result to a single bar
+ * (e.g. only "Hypertension" cases); omit it to get every record in the section.
+ * Results are capped so a "All Time" range cannot exhaustively return the table.
+ */
+export async function getAnalyticsSectionRows(
+  section: AnalyticsDetailSection,
+  rangeKey: AnalyticsRangeKey = '1M',
+  year?: number | null,
+  label?: string | null,
+): Promise<{
+  success: boolean
+  message: string
+  rows: AnalyticsDetailRow[]
+  totalMatched: number
+  rangeLabel: string
+}> {
+  const session = await requireUser()
+  if (!session) {
+    return { success: false, message: 'Unauthorized', rows: [], totalMatched: 0, rangeLabel: '' }
+  }
+
+  const role = (session.user as any)?.role ?? ''
+  if (!['SUPERADMIN', 'ADMIN', 'MEDSTAFF'].includes(role)) {
+    return { success: false, message: 'Unauthorized', rows: [], totalMatched: 0, rangeLabel: '' }
+  }
+
+  const DETAIL_LIMIT = 500
+  const window = resolveAnalyticsDateWindow(rangeKey, year)
+  const rangeLabel = window.label
+
+  try {
+    const appointments = await (prisma as any).appointment.findMany({
+      where: withDateWindow({}, 'appointmentAt', window),
+      select: {
+        appointmentid: true,
+        appointmentAt: true,
+        status: true,
+        userId: true,
+        familyMemberId: true,
+        service: { select: { name: true } },
+        patient: { select: { name: true, birthdate: true, sex: true, bloodType: true } },
+        user: { select: { profile: { select: { firstName: true, lastName: true } } } },
+        familyMember: { select: { name: true, sex: true, birthdate: true, bloodType: true } },
+        medicalHistory: {
+          select: { diagnosis: true, bloodPressure: true, checkedBy: { select: { firstName: true, lastName: true } } },
+        },
+      },
+      orderBy: { appointmentAt: 'desc' },
+    })
+
+    const outcomeLabels: Record<string, string> = {
+      PENDING: 'Pending',
+      APPROVED: 'Approved',
+      COMPLETED: 'Completed',
+      CANCELLED: 'Cancelled',
+      NO_SHOW: 'No Show',
+    }
+
+    const mapped = appointments.map((a: any) => {
+      const service = a.service?.name ?? 'Others'
+      const mh = a.medicalHistory
+      const profile = a.user?.profile
+      const patientName =
+        a.patient?.name ||
+        a.familyMember?.name ||
+        [profile?.firstName, profile?.lastName].filter(Boolean).join(' ').trim() ||
+        'Unnamed patient'
+      const birthdate = a.patient?.birthdate ?? a.familyMember?.birthdate ?? null
+      const age = computeAge(birthdate ? new Date(birthdate) : null)
+      const statusKey = String(a.status ?? '').toUpperCase()
+      const outcome = outcomeLabels[statusKey] ?? statusKey
+
+      return {
+        key: String(a.appointmentid),
+        patientName,
+        age,
+        sex: String(a.patient?.sex ?? a.familyMember?.sex ?? '').trim() || '—',
+        service,
+        reason: reasonFromService(service),
+        outcome,
+        disease: classifyMedicalCase(mh?.diagnosis, mh?.bloodPressure, service),
+        bloodType: String(a.patient?.bloodType ?? a.familyMember?.bloodType ?? '').trim(),
+        ageGroup: age === null ? null : ageGroupLabel(age),
+        hour: a.appointmentAt
+          ? `${String(new Date(a.appointmentAt).getUTCHours()).padStart(2, '0')}:00`
+          : '',
+        date: new Date(a.appointmentAt).toISOString(),
+        diagnosis: String(mh?.diagnosis ?? '').trim(),
+        checkedBy: mh?.checkedBy
+          ? [mh.checkedBy.firstName, mh.checkedBy.lastName].filter(Boolean).join(' ').trim()
+          : '',
+      }
+    })
+
+    const norm = (v: unknown) => String(v ?? '').toLowerCase()
+
+    const eq = (value: unknown) => !!label && norm(value) === norm(label)
+
+    const matches = (r: (typeof mapped)[number]) => {
+      if (!label) return true
+      switch (section) {
+        case 'serviceShare':
+          return norm(r.service) === norm(label)
+        case 'reasons':
+          return norm(r.reason) === norm(label)
+        case 'outcomes':
+          return norm(r.outcome) === norm(label)
+        case 'peakHours':
+          // `label` is the human slot text shown on the chart, not the raw hour.
+          return eq(getSlotLabel(r.hour))
+        case 'ageGroups':
+          return norm(r.ageGroup) === norm(label)
+        case 'diseases':
+          return norm(r.disease) === norm(label)
+        case 'sexByService':
+          return norm(r.service) === norm(label)
+        case 'immunization':
+          return norm(r.service).includes('immuniz') || norm(r.service).includes('vaccin')
+        case 'bloodTypes':
+          return eq(r.bloodType)
+        default:
+          return false
+      }
+    }
+
+    const filtered = mapped.filter(matches)
+
+    const rows: AnalyticsDetailRow[] = filtered.slice(0, DETAIL_LIMIT).map((r) => ({
+      key: r.key,
+      patientName: r.patientName,
+      age: r.age,
+      sex: r.sex,
+      service: r.service,
+      reason: r.reason,
+      outcome: r.outcome,
+      category:
+        section === 'diseases'
+          ? (r.disease ?? '')
+          : section === 'ageGroups'
+            ? (r.ageGroup ?? '')
+            : r.outcome,
+      date: r.date,
+      diagnosis: r.diagnosis,
+      bloodType: r.bloodType || '—',
+      slot: r.hour ? getSlotLabel(r.hour) : '—',
+      disease: r.disease || '—',
+      checkedBy: r.checkedBy || '—',
+    }))
+
+    return {
+      success: true,
+      message: 'Rows fetched.',
+      rows,
+      totalMatched: filtered.length,
+      rangeLabel,
+    }
+  } catch (error) {
+    console.error('[getAnalyticsSectionRows | Prisma | Error]:', error)
+    return { success: false, message: 'Failed to fetch details.', rows: [], totalMatched: 0, rangeLabel }
+  }
+}
+
+export async function getAnalyticsYears(): Promise<{
+  success: boolean
+  message: string
+  years: number[]
+}> {
+  const session = await requireUser()
+  if (!session) {
+    return { success: false, message: 'Unauthorized', years: [] }
+  }
+
+  const role = (session.user as any)?.role ?? ''
+  if (!['SUPERADMIN', 'ADMIN', 'MEDSTAFF'].includes(role)) {
+    return { success: false, message: 'Unauthorized', years: [] }
+  }
+
+  const currentYear = new Date().getFullYear()
+
+  try {
+    const bounds = await (prisma as any).appointment.aggregate({
+      _min: { appointmentAt: true },
+      _max: { appointmentAt: true },
+    })
+
+    const min = bounds?._min?.appointmentAt
+      ? new Date(bounds._min.appointmentAt).getFullYear()
+      : currentYear
+    const max = bounds?._max?.appointmentAt
+      ? new Date(bounds._max.appointmentAt).getFullYear()
+      : currentYear
+
+    const first = Math.max(Math.min(min, currentYear), currentYear - 11)
+    const last = Math.max(max, currentYear)
+
+    const years: number[] = []
+    for (let y = last; y >= first; y--) years.push(y)
+
+    return { success: true, message: 'Years fetched.', years }
+  } catch (error) {
+    console.error('[getAnalyticsYears | Prisma | Error]:', error)
+    return { success: false, message: 'Failed to fetch years.', years: [] }
   }
 }

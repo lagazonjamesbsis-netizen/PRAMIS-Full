@@ -10,6 +10,9 @@ import { nextReferenceId } from '@/lib/referenceId'
 import { createNotification } from '@/lib/actions/notifications'
 import { recordAudit } from '@/lib/actions/audit'
 import { isValidEmail } from '@/lib/helper'
+import { APP_NAME, APP_BASE_URL } from '@/config/constants'
+import { sendMail } from '@/lib/mailer'
+import { FIXED_ADDRESS, PUROKS } from '@/src/data/patientInfo'
 import {
   dayRange,
   todayISO,
@@ -24,6 +27,50 @@ function generateTempPassword(): string {
   let out = ''
   for (let i = 0; i < 10; i++) out += chars[randomInt(chars.length)]
   return out
+}
+
+// Emails the freshly generated login of a new walk-in. The temporary password
+// is deliberately only delivered this way — it is never handed back to the
+// admin UI. Returns whether the message actually went out so the caller can
+// warn the patient differently when SMTP fails.
+async function sendWalkInCredentials({
+  email,
+  tempPassword,
+  displayName,
+  patientId,
+  serviceName,
+}: {
+  email: string
+  tempPassword: string
+  displayName: string
+  patientId: string
+  serviceName: string
+}): Promise<boolean> {
+  try {
+    return await sendMail({
+      to: email,
+      subject: `Your ${APP_NAME} Login Details`,
+      content: `
+        <p>Hi ${displayName},</p>
+        <p>Welcome to ${APP_NAME}. You have been registered as a walk-in for <strong>${serviceName}</strong> and added to today's queue.</p>
+        <p><strong>Patient ID:</strong> ${patientId}</p>
+        <p><strong>Email:</strong> ${email}</p>
+        <p><strong>Temporary password:</strong> ${tempPassword}</p>
+        <p>You can now sign in at <a href="${APP_BASE_URL}/login">${APP_BASE_URL}/login</a>. Please change your password after your first sign-in.</p>
+        <p>If you did not expect this, please ignore this email and contact the health center.</p>
+      `,
+    })
+  } catch (error) {
+    console.error('[sendWalkInCredentials] Error:', error)
+    return false
+  }
+}
+
+// Walk-in addresses are captured as street + purok only. Storing them the same
+// way the signup flow does ("<street>, <purok>") keeps the purok derivable from
+// the address, which is what the population-per-purok aggregation relies on.
+function formatHouseAndPurok(houseNumber: string, purok: string): string {
+  return houseNumber ? `${houseNumber}, ${purok}` : purok
 }
 
 // Calculate age from birthdate
@@ -194,6 +241,74 @@ export type PatientLookup = {
   isSenior: boolean
   isPwd: boolean
   age: number
+  // Identity of the underlying login account / family member this lookup came
+  // from. Always set for rows read off the Patient table.
+  userId?: string | null
+  familyMemberId?: string | null
+  // True when the person exists as an account (or as a family member of one)
+  // but has no Patient row yet, so patientId is blank. addToQueue generates
+  // the PTN-#### when such a candidate is actually queued.
+  pendingPatientRecord?: boolean
+}
+
+// Maps a Patient row (queried with `familyMember` and `user.profile` included)
+// to the lightweight shape the walk-in pickers render. Walk-in patients may not
+// have an account, so the Patient row itself is used as a name/barangay
+// fallback when no profile exists.
+function toPatientLookup(row: any): PatientLookup {
+  const profile = row?.user?.profile
+  const name =
+    row?.familyMember?.name ||
+    (profile
+      ? `${(profile.lastName || '').toUpperCase()}, ${profile.firstName || ''}${profile.middleName ? ' ' + profile.middleName : ''}`.trim()
+      : '') ||
+    row?.name ||
+    ''
+  const birthdate =
+    row?.familyMember?.birthdate || row?.birthdate || profile?.birthdate || null
+  const age = calculateAge(birthdate)
+  return {
+    patientId: row.patientid,
+    name,
+    barangay: profile?.barangay ?? row?.barangay ?? '',
+    hasAccount: Boolean(row.userId),
+    birthdate: birthdate ? new Date(birthdate).toISOString().split('T')[0] : null,
+    isSenior: age >= 60,
+    isPwd: profile?.isPwd === true || row?.familyMember?.isPwd === true,
+    age,
+    userId: row?.userId ?? null,
+    familyMemberId: row?.familyMemberId ?? null,
+  }
+}
+
+// Builds a lookup for someone who has a login account (or is a family member of
+// one) but no Patient row yet, so there is no PTN-#### to show or look up. The
+// name / birthdate / PWD data comes from the profile or the family member, which
+// is the same source a Patient row would have been populated from.
+function toAccountLookup(
+  profile: any,
+  opts: { userId: string; familyMemberId?: string | null; name?: string; birthdate?: any; isPwd?: boolean; barangay?: string | null },
+): PatientLookup {
+  const name =
+    opts.name ||
+    `${(profile?.lastName || '').toUpperCase()}, ${profile?.firstName || ''}${
+      profile?.middleName ? ' ' + profile.middleName : ''
+    }`.trim()
+  const birthdate = opts.birthdate ?? profile?.birthdate ?? null
+  const age = calculateAge(birthdate)
+  return {
+    patientId: '',
+    name,
+    barangay: opts.barangay ?? profile?.barangay ?? '',
+    hasAccount: true,
+    birthdate: birthdate ? new Date(birthdate).toISOString().split('T')[0] : null,
+    isSenior: age >= 60,
+    isPwd: opts.isPwd === true || profile?.isPwd === true,
+    age,
+    userId: opts.userId,
+    familyMemberId: opts.familyMemberId ?? null,
+    pendingPatientRecord: true,
+  }
 }
 
 // Searches for a patient by their ID (PTN-####). It verifies the format of the patient ID, retrieves the patient's record from the database, and returns relevant information such as name, barangay, account status, birthdate, and senior citizen status. The function returns a structured response containing the success status, message, and a PatientLookup object if the patient is found.
@@ -229,37 +344,169 @@ export async function searchPatientById(query: string): Promise<{
     if (!row) {
       return { success: false, message: 'No patient found.', patient: null }
     }
-    const profile = row.user?.profile
-    const name =
-      row.familyMember?.name ||
-      (profile
-        ? `${(profile.lastName || '').toUpperCase()}, ${profile.firstName || ''}${profile.middleName ? ' ' + profile.middleName : ''}`.trim()
-        : '') ||
-      row.name ||
-      ''
-    const birthdate =
-      row.familyMember?.birthdate || row.birthdate || profile?.birthdate || null
-    const age = calculateAge(birthdate)
-    const isSenior = age >= 60
-    const isPwd =
-      profile?.isPwd === true || (row.familyMember as any)?.isPwd === true
     return {
       success: true,
       message: 'Patient verified.',
-      patient: {
-        patientId: row.patientid,
-        name,
-        barangay: profile?.barangay ?? '',
-        hasAccount: Boolean(row.userId),
-        birthdate: birthdate ? new Date(birthdate).toISOString().split('T')[0] : null,
-        isSenior,
-        isPwd,
-        age,
-      },
+      patient: toPatientLookup(row),
     }
   } catch (error) {
     console.error('[searchPatientById | Prisma | Error]:', error)
     return { success: false, message: 'Search failed.', patient: null }
+  }
+}
+
+// Searches patients by name so staff can find a walk-in without asking for the
+// PTN-####. Matching is case-insensitive and partial: every word typed must
+// appear in the stored patient name, the linked account profile, or a linked
+// family member record, so "juan cruz" still finds "DELA CRUZ, JUAN". A numeric
+// or PTN-#### entry matches on the patient ID instead, letting one input serve
+// both lookup styles. Returns at most 10 candidates ordered by patient ID.
+export async function searchPatientsByName(query: string): Promise<{
+  success: boolean
+  message: string
+  patients: PatientLookup[]
+}> {
+  const session = await requireAdmin()
+  if (!session) {
+    const staff = await requireStaff()
+    if (!staff)
+      return { success: false, message: 'Unauthorized', patients: [] }
+  }
+
+  const q = query.trim()
+  if (q.length < 2) {
+    return {
+      success: false,
+      message: 'Type at least 2 characters of the name or ID.',
+      patients: [],
+    }
+  }
+
+  const digits = q.replace(/^PTN-/i, '').trim()
+  const looksLikeId = /^\d+$/.test(digits)
+
+  // Each typed word must match somewhere in the patient's name so multi-word
+  // entries work regardless of the stored "LASTNAME, FIRSTNAME" order.
+  const nameFilters = q
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 4)
+    .map((term) => ({
+      OR: [
+        { name: { contains: term, mode: 'insensitive' } },
+        {
+          familyMember: {
+            is: { name: { contains: term, mode: 'insensitive' } },
+          },
+        },
+        {
+          user: {
+            is: {
+              profile: {
+                is: {
+                  OR: [
+                    { firstName: { contains: term, mode: 'insensitive' } },
+                    { middleName: { contains: term, mode: 'insensitive' } },
+                    { lastName: { contains: term, mode: 'insensitive' } },
+                  ],
+                },
+              },
+            },
+          },
+        },
+      ],
+    }))
+
+  // Accounts (and their family members) that have no Patient row yet still need
+  // to be findable by name: the PTN-#### is only generated once they are
+  // actually queued, so until then they exist only as a login + profile.
+  const profileNameFilters = q
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 4)
+    .map((term) => ({
+      OR: [
+        { firstName: { contains: term, mode: 'insensitive' } },
+        { middleName: { contains: term, mode: 'insensitive' } },
+        { lastName: { contains: term, mode: 'insensitive' } },
+      ],
+    }))
+
+  try {
+    const rows = await (prisma as any).patient.findMany({
+      where: looksLikeId
+        ? { patientid: { contains: digits, mode: 'insensitive' } }
+        : { AND: nameFilters },
+      include: {
+        familyMember: true,
+        user: { include: { profile: true } },
+      },
+      orderBy: { patientid: 'asc' },
+      take: 10,
+    })
+
+    const patients: PatientLookup[] = (rows ?? []).map(toPatientLookup)
+
+    // A numeric entry is always an ID lookup — never widen it to account names.
+    if (!looksLikeId) {
+      const [accounts, members] = await Promise.all([
+        // The signed-up account holder, only when they have no Patient row yet.
+        (prisma as any).user.findMany({
+          where: {
+            deletedAt: null,
+            patients: { none: {} },
+            profile: { is: { AND: profileNameFilters } },
+          },
+          include: { profile: true },
+          orderBy: { createdAt: 'desc' },
+          take: 10,
+        }),
+        // Family members of an account, likewise not yet turned into patients.
+        (prisma as any).familyMember.findMany({
+          where: {
+            patients: { none: {} },
+            name: { contains: q, mode: 'insensitive' },
+          },
+          include: { user: { include: { profile: true } } },
+          orderBy: { createdAt: 'desc' },
+          take: 10,
+        }),
+      ])
+
+      for (const account of (accounts ?? []) as any[]) {
+        if (!account?.profile) continue
+        patients.push(toAccountLookup(account.profile, { userId: account.id }))
+      }
+      for (const member of (members ?? []) as any[]) {
+        if (!member?.user) continue
+        patients.push(
+          toAccountLookup(member.user.profile, {
+            userId: member.userId,
+            familyMemberId: member.familymemberid,
+            name: member.name,
+            birthdate: member.birthdate,
+            isPwd: member.isPwd === true,
+            barangay: member.barangay,
+          }),
+        )
+      }
+    }
+
+    if (patients.length === 0) {
+      return {
+        success: false,
+        message: 'No patient matched that name.',
+        patients: [],
+      }
+    }
+    return {
+      success: true,
+      message: `${patients.length} patient${patients.length > 1 ? 's' : ''} found.`,
+      patients,
+    }
+  } catch (error) {
+    console.error('[searchPatientsByName | Prisma | Error]:', error)
+    return { success: false, message: 'Search failed.', patients: [] }
   }
 }
 
@@ -297,6 +544,7 @@ export async function registerWalkIn(_prevState: any, formData: FormData) {
     let displayName = ''
     let accountEmail = ''
     let tempPassword: string | null = null
+    let credentialsEmailed = false
     let newPatientBirthdate: Date | null = null
     if (patientIdInput) {
       const digits = patientIdInput.replace(/^PTN-/i, '').trim()
@@ -327,10 +575,14 @@ export async function registerWalkIn(_prevState: any, formData: FormData) {
       const sex = formData.get('sex')?.toString().trim() || ''
       const phoneNumber = formData.get('phoneNumber')?.toString().trim() || ''
       const houseNumber = formData.get('houseNumber')?.toString().trim() || ''
-      const barangay = formData.get('barangay')?.toString().trim() || ''
-      const city = formData.get('city')?.toString().trim() || ''
-      const province = formData.get('province')?.toString().trim() || ''
-      const zipCode = formData.get('zipCode')?.toString().trim() || ''
+      const purok = formData.get('purok')?.toString().trim() || ''
+      // Walk-ins are residents of this health center's catchment: only the
+      // street + purok are entered. Barangay / city / province / ZIP are always
+      // fixed to Sumapang Matanda, Malolos, Bulacan 3000.
+      const barangay = FIXED_ADDRESS.barangay
+      const city = FIXED_ADDRESS.municipality
+      const province = FIXED_ADDRESS.province
+      const zipCode = FIXED_ADDRESS.zipCode
       const email = formData.get('email')?.toString().trim().toLowerCase() || ''
 
       if (firstName.length < 2 || lastName.length < 2) {
@@ -354,6 +606,12 @@ export async function registerWalkIn(_prevState: any, formData: FormData) {
       }
       if (!sex) {
         return { success: false, message: "Select the patient's sex." }
+      }
+      if (!purok || !PUROKS.includes(purok)) {
+        return {
+          success: false,
+          message: 'Please select a valid purok in Barangay Sumapang Matanda.',
+        }
       }
       if (email && !isValidEmail(email)) {
         return {
@@ -396,7 +654,9 @@ export async function registerWalkIn(_prevState: any, formData: FormData) {
             lastName,
             birthdate: parsedBirthdate,
             phoneNumber,
-            houseNumber,
+            // "<street>, <purok>" — the same shape the signup flow stores.
+            houseNumber: formatHouseAndPurok(houseNumber, purok),
+            purok,
             barangay,
             city,
             province,
@@ -413,11 +673,14 @@ export async function registerWalkIn(_prevState: any, formData: FormData) {
           birthdate: parsedBirthdate,
           sex,
           phoneNumber: phoneNumber || null,
-          houseNumber: houseNumber || null,
-          barangay: barangay || null,
-          city: city || null,
-          province: province || null,
-          zipCode: zipCode || null,
+          // Same "<street>, <purok>" shape as the profile so the purok also
+          // counts towards the population-per-purok totals.
+          houseNumber: formatHouseAndPurok(houseNumber, purok),
+          purok,
+          barangay,
+          city,
+          province,
+          zipCode,
         },
       })
     }
@@ -513,15 +776,36 @@ export async function registerWalkIn(_prevState: any, formData: FormData) {
       })
     }
 
+    // A new walk-in's login is only ever delivered by email — the temporary
+    // password is never returned to the browser, so it cannot leak on screen,
+    // in logs, or through the client payload.
+    if (accountEmail && tempPassword) {
+      credentialsEmailed = await sendWalkInCredentials({
+        email: accountEmail,
+        tempPassword,
+        displayName,
+        patientId: patient.patientid,
+        serviceName: service.name,
+      })
+      if (!credentialsEmailed) {
+        console.error(
+          `[registerWalkIn] Could not deliver the login credentials for ${patient.patientid} to ${accountEmail}`,
+        )
+      }
+    }
+
     return {
       success: true,
-      message: `${displayName} (${patient.patientid}) registered as a walk-in and added to the queue.`,
+      message:
+        accountEmail && tempPassword
+          ? credentialsEmailed
+            ? `${displayName} (${patient.patientid}) registered as a walk-in and added to the queue. Login details were emailed to ${accountEmail}.`
+            : `${displayName} (${patient.patientid}) registered as a walk-in and added to the queue, but the login email could not be sent — please have the patient use "Forgot password" to set one.`
+          : `${displayName} (${patient.patientid}) registered as a walk-in and added to the queue.`,
       payload: {
         appointmentId: created.appointmentid,
         patientId: patient.patientid,
-        ...(accountEmail && tempPassword
-          ? { email: accountEmail, tempPassword }
-          : {}),
+        ...(accountEmail ? { email: accountEmail, credentialsEmailed } : {}),
       },
     }
   } catch (error) {
@@ -529,6 +813,71 @@ export async function registerWalkIn(_prevState: any, formData: FormData) {
     return {
       success: false,
       message: 'Failed to register the walk-in patient. Please try again.',
+    }
+  }
+}
+
+// Loads a single booked appointment as a ScheduleAppointmentView so the queue
+// board can open the full ITR form before the visit is marked done. This is
+// the scheduled-visit counterpart of getWalkInAppointmentView.
+export async function getScheduledAppointmentView(appointmentId: string): Promise<{
+  success: boolean
+  message: string
+  appointment: ScheduleAppointmentView | null
+}> {
+  const session = await requireAdmin()
+  if (!session) {
+    const staff = await requireStaff()
+    if (!staff) {
+      return { success: false, message: 'Unauthorized', appointment: null }
+    }
+  }
+  if (!appointmentId) {
+    return {
+      success: false,
+      message: 'Appointment ID is required.',
+      appointment: null,
+    }
+  }
+
+  try {
+    const appt = await (prisma as any).appointment.findUnique({
+      where: { appointmentid: appointmentId },
+      include: BOARD_INCLUDE,
+    })
+    if (!appt) {
+      return {
+        success: false,
+        message: 'Appointment not found.',
+        appointment: null,
+      }
+    }
+    if (appt.source !== 'BOOKING') {
+      return {
+        success: false,
+        message: 'Only booked appointments can be opened here.',
+        appointment: null,
+      }
+    }
+    if (['CANCELLED', 'NO_SHOW'].includes(appt.status)) {
+      return {
+        success: false,
+        message: `A ${appt.status === 'NO_SHOW' ? 'no-show' : 'cancelled'} appointment cannot be recorded.`,
+        appointment: null,
+      }
+    }
+
+    return {
+      success: true,
+      message: 'Visit loaded.',
+      appointment: toScheduleView(appt),
+    }
+  } catch (error) {
+    console.error('[getScheduledAppointmentView | Prisma | Error]:', error)
+    return {
+      success: false,
+      message: 'Failed to load the visit.',
+      appointment: null,
     }
   }
 }

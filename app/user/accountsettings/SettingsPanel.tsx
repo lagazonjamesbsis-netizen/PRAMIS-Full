@@ -2,10 +2,11 @@
 
 import { useEffect, useState, useActionState } from 'react'
 import { toast } from 'sonner'
-import { useSession, signOut } from 'next-auth/react'
+import { useSession } from 'next-auth/react'
 import { updateMe, updateMePassword } from '@/lib/actions/me'
 import { useDarkMode } from '@/components/globals/DarkModeContext'
 import FontSizeSetting from '@/components/globals/FontSizeSetting'
+import { useLogoutConfirmation } from '@/components/ui/LogoutConfirmDialog'
 import { ChevronLeft } from 'lucide-react'
 
 type SettingsUser = {
@@ -19,7 +20,6 @@ type SettingsUser = {
 const sections = [
   { id: 'account', label: 'Change Password' },
   { id: 'darkmode', label: 'Dark Mode' },
-  { id: 'display', label: 'Display Settings' },
   { id: 'contact', label: 'Contact' },
   { id: 'terms', label: 'Terms and Conditions' },
   { id: 'about', label: 'About Us' },
@@ -28,6 +28,7 @@ const sections = [
 export default function SettingsPanel({ user }: { user: SettingsUser }) {
   const [active, setActive] = useState('account')
   const { darkMode, setDarkMode } = useDarkMode()
+  const { requestLogout, logoutDialog } = useLogoutConfirmation({ darkMode })
   const [isMobile, setIsMobile] = useState(false)
   const [mobileScreen, setMobileScreen] = useState<'menu' | 'detail'>('menu')
   const [toggles, setToggles] = useState({
@@ -297,13 +298,6 @@ export default function SettingsPanel({ user }: { user: SettingsUser }) {
               data protection laws. Unauthorized access or disclosure of patient
               information is strictly prohibited.
             </p>
-            <p
-              className={`text-[15px] leading-relaxed m-0 ${darkMode ? 'text-[#F9FAFB]' : 'text-[#555]'}`}
-            >
-              PRAMIS reserves the right to update these terms at any time.
-              Users will be notified of any material changes via email or in-app
-              notification.
-            </p>
           </>
         )
       case 'help':
@@ -488,7 +482,7 @@ export default function SettingsPanel({ user }: { user: SettingsUser }) {
       />
       <button
         className={`w-full flex items-center gap-3 px-5 py-2.5 border-none bg-transparent text-[15px] font-semibold font-poppins cursor-pointer text-left transition-colors whitespace-nowrap max-[900px]:px-4 max-[900px]:text-[14px] text-red-500 ${darkMode ? 'hover:bg-[#0f1438]' : 'hover:bg-red-50'}`}
-        onClick={() => signOut({ callbackUrl: '/login' })}
+        onClick={requestLogout}
       >
         Log Out
       </button>
@@ -533,6 +527,7 @@ export default function SettingsPanel({ user }: { user: SettingsUser }) {
           )}
         </>
       )}
+      {logoutDialog}
     </div>
   )
 }
