@@ -124,7 +124,6 @@ export default function Settings({ darkMode, setDarkMode, onLogout }) {
             <h2 className={`text-[22px] font-bold m-0 mb-4 ${darkMode ? 'text-[#F9FAFB]' : 'text-[#1d4662]'}`}>Terms and Conditions</h2>
             <p className={`text-[15px] leading-relaxed m-0 mb-3 ${darkMode ? 'text-[#F9FAFB]' : 'text-[#555]'}`}>By using PRAMIS, you agree to the following terms and conditions. Please read them carefully.</p>
             <p className={`text-[15px] leading-relaxed m-0 mb-3 ${darkMode ? 'text-[#F9FAFB]' : 'text-[#555]'}`}>All patient data must be handled in accordance with applicable data protection laws. Unauthorized access or disclosure of patient information is strictly prohibited.</p>
-            <p className={`text-[15px] leading-relaxed m-0 ${darkMode ? 'text-[#F9FAFB]' : 'text-[#555]'}`}>PRAMIS reserves the right to update these terms at any time.</p>
           </>
         )
       case 'help':

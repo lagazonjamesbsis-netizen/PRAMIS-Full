@@ -298,7 +298,6 @@ export default function SettingsPanel({ user }: { user: SettingsUser }) {
               data protection laws. Unauthorized access or disclosure of patient
               information is strictly prohibited.
             </p>
-            <p className={`text-[15px] leading-relaxed m-0 ${darkMode ? 'text-[#F9FAFB]' : 'text-[#555]'}`}>PRAMIS reserves the right to update these terms at any time.</p>
           </>
         )
       case 'help':
