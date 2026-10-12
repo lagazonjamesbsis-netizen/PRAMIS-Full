@@ -1,7 +1,7 @@
 export const APP_NAME = 'PRAMIS'
 export const APP_BASE_URL = 'https://pramis-kappa.vercel.app/'
   process.env.NODE_ENV === 'production'
-    ? 'https://pramis-kappa.vercel.app/'
+    ? 'https://pramis-smhc.vercel.app/'
     : 'http://localhost:3000'
 
 export const SCHOOL_NAME = 'PRAMIS'
