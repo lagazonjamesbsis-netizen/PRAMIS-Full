@@ -6,11 +6,20 @@ import { revalidateTag } from 'next/cache'
 import { requireAdmin, requireStaff } from '@/lib/actions/guard'
 import { recordAudit } from '@/lib/actions/audit'
 import { nextReferenceId } from '@/lib/referenceId'
-import { dayRange, todayISO } from '@/config/appointment'
+import {
+  dayRange,
+  extractPatientItrInfo,
+  getSlotLabel,
+  todayISO,
+  toMedicalRecordSummary,
+  type ScheduleAppointmentView,
+} from '@/config/appointment'
 
 export type QueueEntry = {
   id: string // APT-#### for scheduled visits, WIQ-#### for queued walk-ins
   kind: 'scheduled' | 'walkin' | 'priority'
+  appointmentId?: string | null // underlying APT-#### for scheduled visits
+  qid?: string | null // underlying WIQ-#### for walk-in rows
   name: string
   time: string // display label
   service: string
@@ -92,8 +101,33 @@ export async function getTodayQueues(): Promise<{
   try {
     const { start, end } = dayRange(todayISO())
 
-    const [appointmentRows, queueRows] = await Promise.all([
-      (prisma as any).appointment.findMany({
+    // NOTE: `IN_CONSULTATION` was recently added to AppointmentStatus. A stale
+    // dev-server / Turbopack bundle can still hold the OLD generated client
+    // which rejects that enum value with PrismaClientValidationError. Try the
+    // full query first, then fall back to APPROVED-only so the page still loads.
+    let appointmentRows: any[]
+    try {
+      appointmentRows = await prisma.appointment.findMany({
+        where: {
+          appointmentAt: { gte: start, lt: end },
+          // WAITING lane = APPROVED, consultation lane = IN_CONSULTATION.
+          // COMPLETED leaves the queue entirely (lives only in history).
+          status: { in: ['APPROVED', 'IN_CONSULTATION'] },
+          source: 'BOOKING',
+        },
+        orderBy: { appointmentAt: 'asc' },
+        include: {
+          service: true,
+          familyMember: true,
+          user: { include: { profile: true } },
+        },
+      })
+    } catch {
+      // Silently fall back: logging the Prisma error object here would make
+      // Next dev show the red "Console PrismaClientValidationError" overlay
+      // even though we recover. So no console.error here on purpose.
+      // Stale client fallback — this value always exists in the old enum.
+      appointmentRows = await prisma.appointment.findMany({
         where: {
           appointmentAt: { gte: start, lt: end },
           status: 'APPROVED',
@@ -105,24 +139,25 @@ export async function getTodayQueues(): Promise<{
           familyMember: true,
           user: { include: { profile: true } },
         },
-      }),
-      (prisma as any).walkInQueue.findMany({
-        where: {
-          createdAt: { gte: start, lt: end },
-          status: { not: 'DONE' },
-        },
-        orderBy: { createdAt: 'asc' },
-        include: {
-          patient: {
-            include: {
-              familyMember: true,
-              user: { include: { profile: true } },
-            },
+      })
+    }
+
+    const queueRows = await prisma.walkInQueue.findMany({
+      where: {
+        createdAt: { gte: start, lt: end },
+        status: { not: 'DONE' },
+      },
+      orderBy: { createdAt: 'asc' },
+      include: {
+        patient: {
+          include: {
+            familyMember: true,
+            user: { include: { profile: true } },
           },
-          service: true,
         },
-      }),
-    ])
+        service: true,
+      },
+    })
 
     const scheduled: QueueEntry[] = []
     const priority: QueueEntry[] = []
@@ -131,12 +166,14 @@ export async function getTodayQueues(): Promise<{
       const entry: QueueEntry = {
         id: row.appointmentid,
         kind: 'scheduled' as const,
+        appointmentId: row.appointmentid,
+        qid: null,
         name: row.familyMember
           ? row.familyMember.name
           : profileName(row.user?.profile) || row.user?.email || 'Unknown',
         time: clockLabel(new Date(row.appointmentAt)),
         service: row.service?.name ?? 'Consultation',
-        status: row.status === 'COMPLETED' ? 'DONE' : 'WAITING',
+        status: row.status === 'IN_CONSULTATION' ? 'IN_CONSULTATION' : 'WAITING',
         priority: dbPriority ?? undefined,
         uploadedId: row.user?.profile?.validId || null,
       }
@@ -155,6 +192,8 @@ export async function getTodayQueues(): Promise<{
       const entry: QueueEntry = {
         id: row.qid,
         kind,
+        appointmentId: null,
+        qid: row.qid,
         name:
           row.patient?.familyMember?.name ||
           profileName(row.patient?.user?.profile) ||
@@ -399,6 +438,214 @@ export async function addToQueue(_prevState: any, formData: FormData) {
   }
 }
 
+async function syncWalkInAppointmentOnConsult(qid: string) {
+  // Mirrors WalkInQueue.IN_CONSULTATION onto the walk-in Appointment row.
+  // Saving the medical record is the only thing that flips both to DONE/COMPLETED.
+  try {
+    const entry = await (prisma as any).walkInQueue.findUnique({
+      where: { qid },
+      select: { patientId: true, serviceId: true },
+    })
+    if (!entry?.patientId) return
+    const { start, end } = dayRange(todayISO())
+    const existing = await (prisma as any).appointment.findFirst({
+      where: {
+        patientId: entry.patientId,
+        source: 'WALKIN',
+        appointmentAt: { gte: start, lt: end },
+      },
+    })
+    if (existing) {
+      if (existing.status === 'APPROVED') {
+        await (prisma as any).appointment.update({
+          where: { appointmentid: existing.appointmentid },
+          data: { status: 'IN_CONSULTATION' },
+        })
+      }
+    } else {
+      let serviceId = entry.serviceId
+      if (!serviceId) {
+        const fallback = await (prisma as any).service.findFirst({
+          where: { availability: true },
+          orderBy: { serviceid: 'asc' },
+          select: { serviceid: true },
+        })
+        serviceId = fallback?.serviceid ?? null
+      }
+      if (serviceId) {
+        const patient = await (prisma as any).patient.findUnique({
+          where: { patientid: entry.patientId },
+          select: { userId: true },
+        })
+        await (prisma as any).appointment.create({
+          data: {
+            appointmentid: await nextReferenceId('APT'),
+            patientId: entry.patientId,
+            userId: patient?.userId ?? null,
+            serviceId,
+            source: 'WALKIN',
+            appointmentAt: new Date(),
+            status: 'IN_CONSULTATION',
+          },
+        })
+      }
+    }
+  } catch (err) {
+    console.error('[syncWalkInAppointmentOnConsult | Error]:', err)
+  }
+}
+
+export async function getWalkInItrAppointment(
+  qid: string,
+): Promise<{
+  success: boolean
+  message: string
+  appointment: ScheduleAppointmentView | null
+}> {
+  const session = await requireAdmin()
+  if (!session) {
+    const staff = await requireStaff()
+    if (!staff) {
+      return { success: false, message: 'Unauthorized', appointment: null }
+    }
+  }
+  if (!qid) {
+    return {
+      success: false,
+      message: 'Queue entry ID is required.',
+      appointment: null,
+    }
+  }
+
+  try {
+    const queueEntry = await (prisma as any).walkInQueue.findUnique({
+      where: { qid },
+      select: { patientId: true, serviceId: true, status: true },
+    })
+    if (!queueEntry) {
+      return {
+        success: false,
+        message: 'Queue entry not found.',
+        appointment: null,
+      }
+    }
+    if (queueEntry.status !== 'IN_CONSULTATION') {
+      return {
+        success: false,
+        message: 'Start the consultation before completing the visit.',
+        appointment: null,
+      }
+    }
+
+    const { start, end } = dayRange(todayISO())
+    const include = {
+      service: true,
+      patient: true,
+      familyMember: true,
+      user: { include: { profile: true } },
+      medicalHistory: true,
+    }
+    let appointment = await (prisma as any).appointment.findFirst({
+      where: {
+        patientId: queueEntry.patientId,
+        source: 'WALKIN',
+        appointmentAt: { gte: start, lt: end },
+      },
+      include,
+    })
+
+    if (!appointment) {
+      let serviceId = queueEntry.serviceId
+      if (!serviceId) {
+        const service = await (prisma as any).service.findFirst({
+          where: { availability: true },
+          orderBy: { serviceid: 'asc' },
+          select: { serviceid: true },
+        })
+        serviceId = service?.serviceid ?? null
+      }
+      if (!serviceId) {
+        return {
+          success: false,
+          message: 'No available service exists for this walk-in record.',
+          appointment: null,
+        }
+      }
+
+      const patient = await (prisma as any).patient.findUnique({
+        where: { patientid: queueEntry.patientId },
+        select: { userId: true, familyMemberId: true },
+      })
+      if (!patient) {
+        return {
+          success: false,
+          message: 'The patient for this queue entry no longer exists.',
+          appointment: null,
+        }
+      }
+      appointment = await (prisma as any).appointment.create({
+        data: {
+          appointmentid: await nextReferenceId('APT'),
+          patientId: queueEntry.patientId,
+          userId: patient.userId,
+          familyMemberId: patient.familyMemberId,
+          serviceId,
+          source: 'WALKIN',
+          appointmentAt: new Date(),
+          status: 'IN_CONSULTATION',
+        },
+        include,
+      })
+    }
+
+    const at = new Date(appointment.appointmentAt)
+    const dateISO = at.toISOString().slice(0, 10)
+    const profile = appointment.user?.profile
+    const name =
+      appointment.familyMember?.name ||
+      (profile
+        ? `${(profile.lastName || '').toUpperCase()}, ${profile.firstName || ''}${
+            profile.middleName ? ` ${profile.middleName}` : ''
+          }`.trim()
+        : appointment.patient?.name || appointment.user?.email || 'Unknown patient')
+    return {
+      success: true,
+      message: 'Walk-in treatment record ready.',
+      appointment: {
+        id: appointment.appointmentid,
+        patientName: name,
+        patientReference: appointment.patient?.patientid || appointment.user?.id || '',
+        email: appointment.user?.email || '',
+        serviceName: appointment.service?.name ?? 'Service',
+        dateISO,
+        dateLabel: at.toLocaleDateString('en-US', {
+          weekday: 'long',
+          month: 'long',
+          day: 'numeric',
+          year: 'numeric',
+          timeZone: 'UTC',
+        }),
+        timeLabel: getSlotLabel(
+          `${String(at.getUTCHours()).padStart(2, '0')}:00`,
+        ),
+        status: appointment.status,
+        patientInfo: extractPatientItrInfo(appointment),
+        hasMedicalRecord: Boolean(appointment.medicalHistory),
+        medicalRecord: appointment.medicalHistory
+          ? toMedicalRecordSummary(appointment.medicalHistory)
+          : null,
+      },
+    }
+  } catch (error) {
+    console.error('[getWalkInItrAppointment | Prisma | Error]:', error)
+    return {
+      success: false,
+      message: 'Failed to load the walk-in treatment record.',
+      appointment: null,
+    }
+  }
+}
+
 // Advances the status of a queue entry (scheduled or walk-in) based on its current status. It checks for user authorization (admin or staff), validates the input queue ID, and updates the status in the database. If the entry is marked as "DONE," it also updates any related scheduled appointments for the patient. The function returns a success status and message indicating the result of the operation. If an error occurs during the database update, it logs the error and returns a failure status with an appropriate message.
 async function syncWalkInAppointmentOnDone(qid: string) {
   try {
@@ -453,6 +700,9 @@ async function syncWalkInAppointmentOnDone(qid: string) {
   }
 }
 
+// Correct flow: WAITING -> IN_CONSULTATION (medstaff starts the visit, admin
+// sees it for charting) -> DONE only when the medical record is saved
+// (COMPLETED + history). There is intentionally no WAITING -> DONE jump.
 export async function advanceQueueEntry(
   qid: string,
 ): Promise<{ success: boolean; message: string }> {
@@ -470,24 +720,29 @@ export async function advanceQueueEntry(
     })
     if (!row) return { success: false, message: 'Queue entry not found.' }
 
-    const next =
-      row.status === 'WAITING'
-        ? 'IN_CONSULTATION'
-        : row.status === 'IN_CONSULTATION'
-          ? 'DONE'
-          : null
-    if (!next) {
+    if (row.status === 'IN_CONSULTATION') {
+      return {
+        success: false,
+        message:
+          'This visit is in consultation — save the medical record to complete it.',
+      }
+    }
+    if (row.status !== 'WAITING') {
       return { success: false, message: 'This entry is already done.' }
     }
+
+    const next = 'IN_CONSULTATION'
 
     await (prisma as any).walkInQueue.update({
       where: { qid },
       data: { status: next },
     })
 
-    if (next === 'DONE') {
-      await syncWalkInAppointmentOnDone(qid)
-    }
+    // IN_CONSULTATION moves the visit into the appointment record for admin
+    // charting; only saving the medical record completes it (which also flips
+    // this queue row to DONE). The IN_CONSULTATION queue row stays visible so
+    // medstaff can still see who is being served.
+    await syncWalkInAppointmentOnConsult(qid)
 
     revalidateTag('queues', 'max')
     revalidateTag('appointments', 'max')
@@ -502,8 +757,7 @@ export async function advanceQueueEntry(
 
     return {
       success: true,
-      message:
-        next === 'DONE' ? 'Visit marked as done.' : 'Consultation started.',
+      message: 'Consultation started.',
     }
   } catch (error) {
     console.error('[advanceQueueEntry | Prisma | Error]:', error)
@@ -511,7 +765,10 @@ export async function advanceQueueEntry(
   }
 }
 
-// Marks a queue entry as "DONE" based on the provided queue ID. It checks for user authorization (admin or staff), validates the input queue ID, and updates the status in the database. The function returns a success status and message indicating the result of the operation. If an error occurs during the database update, it logs the error and returns a failure status with an appropriate message.
+// Marks a queue entry as "DONE" based on the provided queue ID. Reserved for
+// the medical-record save path (and legacy cleanup): IN_CONSULTATION queue
+// rows are NOT completable from the board — saving the record is what flips
+// both the appointment (COMPLETED) and this queue row (DONE).
 export async function markQueueDone(
   qid: string,
 ): Promise<{ success: boolean; message: string }> {

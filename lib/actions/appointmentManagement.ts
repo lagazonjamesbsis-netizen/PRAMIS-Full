@@ -9,7 +9,8 @@ import { requireAdmin, requireStaff } from '@/lib/actions/guard'
 import { nextReferenceId } from '@/lib/referenceId'
 import { createNotification } from '@/lib/actions/notifications'
 import { recordAudit } from '@/lib/actions/audit'
-import { isValidEmail } from '@/lib/helper'
+import { isValidEmail, isValidPhone } from '@/lib/helper'
+import { MAX } from '@/src/lib/constants'
 import { APP_NAME, APP_BASE_URL } from '@/config/constants'
 import { sendMail } from '@/lib/mailer'
 import { FIXED_ADDRESS, PUROKS } from '@/src/data/patientInfo'
@@ -585,6 +586,30 @@ export async function registerWalkIn(_prevState: any, formData: FormData) {
           message: "Enter the walk-in patient's first and last name.",
         }
       }
+      if (firstName.length > MAX.NAME || lastName.length > MAX.NAME) {
+        return {
+          success: false,
+          message: `Names must be ${MAX.NAME} characters or fewer.`,
+        }
+      }
+      if (phoneNumber.length > MAX.PHONE) {
+        return {
+          success: false,
+          message: `Mobile number must be ${MAX.PHONE} characters or fewer.`,
+        }
+      }
+      if (phoneNumber && !isValidPhone(phoneNumber)) {
+        return {
+          success: false,
+          message: 'Enter a valid PH mobile number (e.g. 917 123 4567).',
+        }
+      }
+      if (email.length > MAX.EMAIL) {
+        return {
+          success: false,
+          message: `Email must be ${MAX.EMAIL} characters or fewer.`,
+        }
+      }
       const parsedBirthdate = birthdate
         ? new Date(`${birthdate}T00:00:00.000Z`)
         : null
@@ -908,7 +933,7 @@ export async function getWalkInAppointmentView(qid: string): Promise<{
       where: {
         patientId: entry.patientId,
         source: 'WALKIN',
-        status: { in: ['APPROVED', 'COMPLETED'] },
+        status: { in: ['APPROVED', 'IN_CONSULTATION', 'COMPLETED'] },
         appointmentAt: { gte: start, lt: end },
       },
       orderBy: { appointmentAt: 'desc' },
@@ -940,7 +965,8 @@ export async function getWalkInAppointmentView(qid: string): Promise<{
           serviceId,
           source: 'WALKIN',
           appointmentAt: new Date(),
-          status: 'APPROVED',
+          // Mirror the queue: a visit already in consultation opens chartable.
+          status: entry.status === 'IN_CONSULTATION' ? 'IN_CONSULTATION' : 'APPROVED',
         },
         include: BOARD_INCLUDE,
       })

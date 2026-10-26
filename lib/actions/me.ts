@@ -9,6 +9,7 @@ import { cacheLife, cacheTag, revalidateTag } from 'next/cache'
 import { getServerSession, Session } from 'next-auth'
 import { authOptions } from '@/lib/authOptions'
 import { isValidEmail } from '@/lib/helper'
+import { MAX } from '@/src/lib/constants'
 import { sanitizeUser, requireUser } from '@/lib/actions/guard'
 import { recordAudit } from '@/lib/actions/audit'
 import { nextReferenceId } from '@/lib/referenceId'
@@ -513,6 +514,23 @@ export async function updateMyProfile(
     }
   })
 
+  // Max-length safety net (client already enforces MAX.* via the inputs).
+  if (firstName.length > MAX.NAME) {
+    errors.firstName = `First name must be ${MAX.NAME} characters or fewer.`
+  }
+  if (middleName.length > MAX.NAME) {
+    errors.middleName = `Middle name must be ${MAX.NAME} characters or fewer.`
+  }
+  if (lastName.length > MAX.NAME) {
+    errors.lastName = `Last name must be ${MAX.NAME} characters or fewer.`
+  }
+  if (suffix.length > MAX.SHORT_NAME) {
+    errors.suffix = `Suffix must be ${MAX.SHORT_NAME} characters or fewer.`
+  }
+  if (phoneNumber.length > MAX.PHONE) {
+    errors.phoneNumber = `Mobile number must be ${MAX.PHONE} characters or fewer.`
+  }
+
   if (email && !isValidEmail(email)) {
     errors['email'] = 'Please enter a valid email address.'
   }
@@ -704,6 +722,111 @@ export async function updateMe(_prevState: any, formData: FormData) {
       payload: null,
       message: 'Failed to update profile. Please call admin.',
     }
+  }
+}
+
+// Patient-side self deletion: anonymizes the account but keeps clinical
+// history. Patient rows, appointments and medical histories stay in the
+// database (userId set to null) so past visits remain visible to staff.
+export async function deleteMyAccount(formData: FormData) {
+  const session = (await getServerSession(authOptions)) as Session | null
+  if (!session?.user?.id || session.user.accountType === 'staff') {
+    return { success: false, message: 'User not authenticated!' }
+  }
+
+  const password = formData.get('password')?.toString().trim()
+  const id = session.user.id
+
+  // Verify the user's current password before deleting the account.
+  if (!password) {
+    return { success: false, message: 'Password is required.' }
+  }
+  try {
+    const user = await (prisma as any).user.findFirst({
+      where: { id },
+      select: { password: true },
+    })
+    if (!user || !user.password || !(await compare(password, user.password))) {
+      return { success: false, message: 'Password is incorrect.' }
+    }
+  } catch (error) {
+    console.error('[deleteMyAccount | Password Verify | Error]:', error)
+    return { success: false, message: 'Failed to verify your password. Please try again.' }
+  }
+
+  try {
+    const user = await (prisma as any).user.findFirst({
+      where: { id },
+      select: {
+        id: true,
+        email: true,
+        appointments: {
+          where: { status: { in: ['PENDING', 'APPROVED'] } },
+          select: { appointmentid: true },
+        },
+      },
+    })
+    if (!user) return { success: false, message: 'Account not found.' }
+    if (user.appointments?.length) {
+      return {
+        success: false,
+        message: 'Please cancel your upcoming appointments before deleting your account.',
+      }
+    }
+    const anonymizedEmail = `deleted+${id}@deleted.local`
+    // Keep clinical rows: patients + appointments stay and are unlinked from
+    // the login. Family members are deleted only when they have no linked
+    // patient/appointment rows; otherwise they are kept for history.
+    await (prisma as any).patient.updateMany({
+      where: { userId: id },
+      data: { userId: null },
+    })
+    await (prisma as any).appointment.updateMany({
+      where: { userId: id },
+      data: { userId: null },
+    })
+    const members = await (prisma as any).familyMember.findMany({
+      where: { userId: id },
+      select: {
+        familymemberid: true,
+        patients: { select: { patientid: true } },
+        appointments: { select: { appointmentid: true } },
+      },
+    })
+    for (const m of members) {
+      if (m.patients?.length || m.appointments?.length) continue
+      await (prisma as any).familyMember.delete({
+        where: { familymemberid: m.familymemberid },
+      })
+    }
+    await (prisma as any).notification.deleteMany({ where: { userId: id } })
+    await (prisma as any).userProfile.deleteMany({ where: { userId: id } })
+    await (prisma as any).user.update({
+      where: { id },
+      data: {
+        email: anonymizedEmail,
+        password: 'deleted',
+        status: 'INACTIVE',
+        deletedAt: new Date(),
+        updatedAt: new Date(),
+      },
+    })
+    revalidateTag('me', 'max')
+    revalidateTag('patients', 'max')
+    await recordAudit({
+      action: 'DELETE',
+      entity: 'USER',
+      entityId: id,
+      description: `Patient deleted their own account ${user.email}. Clinical history was preserved.`,
+      metadata: { self: true, email: user.email },
+    })
+    return {
+      success: true,
+      message: 'Your account was deleted. Your past visit history stays with the health center.',
+    }
+  } catch (error) {
+    console.error('[deleteMyAccount | Prisma | Error]:', error)
+    return { success: false, message: 'Failed to delete your account. Please try again.' }
   }
 }
 
